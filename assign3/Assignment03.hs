@@ -191,3 +191,10 @@ requireVs n = (
     (map (\i -> (i, C, i)) [0..n]) -- for state i, C -> i
         ++ (map (\i -> (i, V, i + 1)) [0..n-1]) -- for state i != n, V -> i + 1
     )
+
+
+forward2 :: (Eq a) => Automaton a -> SnocList a -> State -> Bool
+forward2 m w q = let (states, syms, i, f, delta) = m in
+    case w of
+        ESL -> elem q i
+        rest:::x -> or( map (\q' -> elem (q', x, q) delta && forward2 m rest q') states)
