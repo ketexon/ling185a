@@ -37,23 +37,35 @@ maybeToList (Just a) = [a]
 catMaybes :: [Maybe a] -> [a]
 catMaybes [] = []
 catMaybes (x:xs) = case x of
-    Just y -> y:(catMaybes xs)
+    Just y -> y:catMaybes xs
     Nothing -> catMaybes xs
 
+mapMaybe :: (a -> Maybe b) -> [a] -> [b]
+mapMaybe f [] = []
+mapMaybe f (x:xs) = case f x of
+    Just y -> y:mapMaybe f xs
+    Nothing -> mapMaybe f xs
 
-minNTLength :: (Eq nt, Eq t) => [RewriteRule nt t] -> nt -> Maybe Int
+unwrapStack :: Stack a -> a
+unwrapStack (Bar a) = a
+unwrapStack (NoBar a) = a
+
+minNTLength :: (Eq nt, Eq t) => [RewriteRule nt t] -> nt -> Int
 minNTLength rules nt
-    = case filteredRules of
-        [] -> Nothing
-        rules -> Nothing -- foldr1 $ (catMaybes $ )
+    = minimum $ recurse `map` filteredRules
     where
         -- only select rules whose LHS is nt and that are
         -- not recursive
         ruleFilter (NTRule ruleNT children)
-            = ruleNT == nt && not (elem nt children)
+            = ruleNT == nt && notElem nt children
+        ruleFilter (TRule ruleNT _) = ruleNT == nt
         filteredRules = ruleFilter `filter` rules
-        getNTRuleChildren (NTRule _ children) = children
-        test = ((map minNTLength) . getNTRuleChildren) `map` rules
+        recurse (NTRule _ children) = sum $ minNTLength rules `map` children
+        recurse (TRule _ _) = 1
+        recurse NoRule = 0
+
+minNTStackLength :: (Eq nt, Eq t) => [RewriteRule nt t] -> Stack nt -> Int
+minNTStackLength rules = minNTLength rules . unwrapStack
 
 -- 1.1 A
 isRuleCNF :: RewriteRule nt t -> Bool
@@ -64,7 +76,7 @@ isRuleCNF _ = False
 
 -- 1.1 B
 isCNF :: CFG nt t -> Bool
-isCNF (_, _, _, rules) = and $ map isRuleCNF rules
+isCNF (_, _, _, rules) = all isRuleCNF rules
 
 -- 1.2
 pathsToGoalFSA :: (Eq st, Eq sy) =>
@@ -74,7 +86,7 @@ pathsToGoalFSA :: (Eq st, Eq sy) =>
 pathsToGoalFSA (current, history) rules goals
     = if current `elem` goals
         then [history ++ [current]]
-        else foldr (++) [] ((\newState -> pathsToGoalFSA (newState, history ++ [current]) rules goals) <$> possibleConsumptions)
+        else concatMap (\newState -> pathsToGoalFSA (newState, history ++ [current]) rules goals) possibleConsumptions
     where
         possibleConsumptions = consumeFSA rules current
 
@@ -85,7 +97,7 @@ isNTRule _ = False
 -- returns the nt for a terminal t such that TRule nt t is in the rules
 findNTsGeneratingT :: (Eq nt, Eq t) => [RewriteRule nt t] -> t -> [nt]
 findNTsGeneratingT rules terminal
-    = catMaybes (getNT <$> rules)
+    = mapMaybe getNT rules
     where
         getNT (TRule nt t) = if t == terminal then Just nt else Nothing
         getNT _ = Nothing
@@ -104,9 +116,10 @@ shift rules (stack, terminal:syms)
                 (stack ++ [NoBar nt], syms) -- append to stack
 shift _ (_, []) = []
 
+
 reduce :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
 reduce rules (stack, str)
-    =  catMaybes $ map tryApplyNTRule rules
+    =  mapMaybe tryApplyNTRule rules
     where
         stackLength = length stack
         tryApplyNTRule (NTRule nt children)
@@ -121,6 +134,7 @@ reduce rules (stack, str)
                 childrenLength = length children
         tryApplyNTRule _ = Nothing
 
+
 finiteReduce :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
 finiteReduce rules config
     = filter parseStepFilter steps
@@ -129,6 +143,7 @@ finiteReduce rules config
         -- filter out rules of the form A -> epsilon
         parseStepFilter (ParseStep _ (NTRule _ []) _) = False
         parseStepFilter _ = True
+
 
 finiteBottomUp :: (Eq nt, Eq t) => CFG nt t -> [t] -> [[ParseStep nt t]]
 finiteBottomUp (nts, ts, start, rules) input
@@ -139,6 +154,26 @@ finiteBottomUp (nts, ts, start, rules) input
 
 
 -- 1.3 D
+parserInternal :: (Eq nt, Eq t)
+       => [[RewriteRule nt t] -> Config nt t -> [ParseStep nt t]]
+          -- ^ List of transition steps. ^
+       -> [RewriteRule nt t]  -- Rules from the CFG.
+       -> Config nt t         -- Starting configuration.
+       -> Config nt t         -- Goal configuration.
+       -> [[ParseStep nt t]]  -- List of possible parses.
+parserInternal transitions rules startConfig goalConfig
+    = concatMap continueStep steps
+    where
+        -- [ParseStep SHIFT ... NewConfig]
+        results = concatMap (\t -> t rules startConfig) transitions
+        steps = concatMap (\t -> t rules startConfig) transitions
+        continueStep step
+            = if newConfig == goalConfig
+                then [[step]]
+                else (step:) `map` parserInternal transitions rules newConfig goalConfig
+            where
+                ParseStep transition rule newConfig = step
+
 
 parser :: (Eq nt, Eq t)
        => [[RewriteRule nt t] -> Config nt t -> [ParseStep nt t]]
@@ -148,20 +183,13 @@ parser :: (Eq nt, Eq t)
        -> Config nt t         -- Goal configuration.
        -> [[ParseStep nt t]]  -- List of possible parses.
 parser transitions rules startConfig goalConfig
-    = foldr (++) [] $ map continueStep steps
-    where
-        steps = foldr (++) [] $ (\t -> t rules startConfig) <$> transitions
-        continueStep step
-            = if newConfig == goalConfig
-                then [[step]]
-                else (step:) <$> parser transitions rules newConfig goalConfig
-            where
-                ParseStep transition rule newConfig = step
+    = (ParseStep NoTransition NoRule startConfig:) `map` parserInternal transitions rules startConfig goalConfig
+
 
 parserStep transitions rules startConfig goalConfig
     = steps
     where
-        steps = foldr (++) [] $ (\t -> t rules startConfig) <$> transitions
+        steps = concatMap (\t -> t rules startConfig) transitions
         continueStep step
             = if newConfig == goalConfig
                 then [[step]]
@@ -176,7 +204,7 @@ predict rules (nt:nts, str)
     -- if the current stack is larger than str,
     -- then it cannot be valid, since each nonterminal
     -- eventually produces at least 1 terminal node
-    = if 1 + length nts > length str
+    = if minNTStackLength rules nt + sum (minNTStackLength rules `map` nts) > length str
         then []
         else ruleToParseStep <$> filteredRules
     where
@@ -191,6 +219,27 @@ predict rules (nt:nts, str)
                 (NTRule p children) = rule
 -- can't predict if there's no symbol on stack
 predict _ ([], _) = []
+
+finitePredict :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
+finitePredict rules (nt:nts, str)
+    -- if the current stack is larger than str,
+    -- then it cannot be valid, since each nonterminal
+    -- eventually produces at least 1 terminal node
+    = if minNTStackLength rules nt + sum (minNTStackLength rules `map` nts) > length str
+        then []
+        else ruleToParseStep <$> filteredRules
+    where
+        ruleFilter (NTRule p _) = nt == NoBar p
+        ruleFilter _ = False
+        -- rules whose lhs is p and RHS is a nonterminal
+        filteredRules = filter ruleFilter rules
+        ruleToParseStep rule
+            = ParseStep Predict rule
+                ((NoBar <$> children) ++ nts, str)
+            where
+                (NTRule p children) = rule
+-- can't predict if there's no symbol on stack
+finitePredict _ ([], _) = []
 
 match :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
 match rules (nt:nts, sym:syms)
@@ -209,8 +258,8 @@ topDown (nts, ts, start, rules) input
 
 -- 1.3 F
 -- same as shift but prepend to stack
-lcShift :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
-lcShift rules (stack, terminal:syms)
+shiftLC :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
+shiftLC rules (stack, terminal:syms)
     = ntToParseStep <$> nts
     where
         nts = findNTsGeneratingT rules terminal
@@ -218,21 +267,21 @@ lcShift rules (stack, terminal:syms)
             = ParseStep
                 Shift
                 (TRule nt terminal)
-                ((NoBar nt):stack, syms) -- append to stack
-lcShift _ (_, []) = []
+                (NoBar nt:stack, syms) -- append to stack
+shiftLC _ (_, []) = []
 
 -- same as match but require stack top to be barred
-lcMatch :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
-lcMatch rules (nt:nts, sym:syms)
+matchLC :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
+matchLC rules (nt:nts, sym:syms)
     = case find ((==nt) . Bar) $ findNTsGeneratingT rules sym of
         Just nt -> [ParseStep Match (TRule nt sym) (nts, syms)]
         Nothing -> []
 -- Cant match if there's empty stack or empty string
-lcMatch rules _ = []
+matchLC rules _ = []
 
 
-lcPredict :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
-lcPredict rules (nt:nts, str)
+predictLC :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
+predictLC rules (nt:nts, str)
     = ruleToParseStep <$> filteredRules
     where
         ruleFilter (NTRule p (child:children)) = nt == NoBar child
@@ -241,14 +290,14 @@ lcPredict rules (nt:nts, str)
         filteredRules = filter ruleFilter rules
         ruleToParseStep rule
             = ParseStep Predict rule
-                ((Bar <$> (drop 1 children)) ++ (NoBar p):nts, str)
+                ((Bar <$> drop 1 children) ++ NoBar p:nts, str)
             where
                 (NTRule p children) = rule
 -- can't predict if there's no symbol on stack
-lcPredict _ ([], _) = []
+predictLC _ ([], _) = []
 
-lcConnect :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
-lcConnect rules (nt1:nt2:nts, str)
+connectLC :: (Eq nt, Eq t) => [RewriteRule nt t] -> Config nt t -> [ParseStep nt t]
+connectLC rules (nt1:nt2:nts, str)
     = ruleToParseStep <$> filteredRules
     where
         ruleFilter (NTRule p (child:children)) = nt2 == Bar p && nt1 == NoBar child
@@ -257,15 +306,15 @@ lcConnect rules (nt1:nt2:nts, str)
         filteredRules = filter ruleFilter rules
         ruleToParseStep rule
             = ParseStep Connect rule
-                ((Bar <$> (drop 1 children)) ++ nts, str)
+                ((Bar <$> drop 1 children) ++ nts, str)
             where
                 (NTRule p children) = rule
 -- cant connect if there's not two symbols on stack
-lcConnect _ _ = []
+connectLC _ _ = []
 
 leftCorner :: (Eq nt, Eq t) => CFG nt t -> [t] -> [[ParseStep nt t]]
 leftCorner (nts, ts, start, rules) input
-    = parser [lcShift, lcPredict, lcMatch, lcConnect] rules startingConfig goalConfig
+    = parser [shiftLC, predictLC, matchLC, connectLC] rules startingConfig goalConfig
     where
         startingConfig = ([Bar start], input)
         goalConfig = ([], [])
@@ -286,3 +335,20 @@ cfgRev
             TRule AB_A 'a', TRule AB_B 'b'
         ]
     )
+
+-- L(G) = { ww^R : w \in {a, b}* }
+cfgInf :: CFG AB Char
+cfgInf
+    = (
+        [AB_S],
+        ['a'],
+        AB_S,
+        [
+            NTRule AB_S [AB_S], TRule AB_S 'a'
+        ]
+    )
+
+
+test = minNTLength rules
+    where
+        (_, _, _, rules) = cfg12
